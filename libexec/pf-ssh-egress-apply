@@ -1,0 +1,51 @@
+#!/bin/sh
+#
+# pf-ssh-egress-apply — SSH 아웃바운드 차단 정책의 멱등적 적용/자가치유
+#
+# LaunchDaemon(com.kyobo.pf-ssh-egress)이 부팅 시 1회 + 5분 주기로 실행한다.
+# 주기 실행의 목적: OS 업데이트나 다른 서비스가 pf 룰셋을 플러시/비활성화해도
+# 정책이 조용히 사라지지 않도록 되돌리기 위함.
+#
+set -u
+
+PFCTL=/sbin/pfctl
+IFCONFIG=/sbin/ifconfig
+ANCHOR=com.kyobo.ssh-egress
+PFCONF=/etc/pf.conf
+TAG=pf-ssh-egress
+
+log() { /usr/bin/logger -t "$TAG" -- "$*"; }
+
+[ "$(/usr/bin/id -u)" -eq 0 ] || { echo "root 권한 필요" >&2; exit 1; }
+
+# 0) pflog0 확보. macOS 는 이 인터페이스를 자동으로 만들어 주지 않는다.
+#    없으면 `log` 규칙의 기록이 갈 곳이 없어 차단 시도 감사가 불가능해진다.
+#    (차단 자체는 pflog0 없이도 동작한다.)
+if ! "$IFCONFIG" pflog0 >/dev/null 2>&1; then
+    log "pflog0 없음 — 생성"
+    "$IFCONFIG" pflog0 create 2>&1 | while read -r l; do log "$l"; done
+fi
+"$IFCONFIG" pflog0 up >/dev/null 2>&1
+
+# 1) pf 활성화. macOS 는 참조카운트 방식(-E/-X)이므로 -E 로 한 번 잡아두면
+#    다른 서비스가 -X 로 해제해도 카운트가 0 이 되지 않아 계속 켜져 있다.
+if "$PFCTL" -s info 2>/dev/null | /usr/bin/head -1 | /usr/bin/grep -q "Disabled"; then
+    log "pf 가 비활성 상태 — 활성화"
+    "$PFCTL" -E 2>&1 | while read -r l; do log "$l"; done
+fi
+
+# 2) 우리 앵커가 실제 룰셋에 살아 있는지 확인. 없으면 pf.conf 재적재.
+if ! "$PFCTL" -a "$ANCHOR" -s rules 2>/dev/null | /usr/bin/grep -q "^block return in"; then
+    log "앵커 '$ANCHOR' 이 비어 있거나 사라짐 — $PFCONF 재적재"
+    "$PFCTL" -f "$PFCONF" 2>&1 | while read -r l; do log "$l"; done
+fi
+
+# 3) 화이트리스트 테이블을 파일 기준으로 동기화.
+#    (pf.conf 의 `file` 지시자가 로드 시점에 이미 채우지만, 파일만 수정되고
+#     리로드가 없었던 경우를 대비해 항상 맞춰 준다.)
+TABLE_FILE=/etc/pf.anchors/ssh-egress-allow.table
+if [ -f "$TABLE_FILE" ]; then
+    "$PFCTL" -a "$ANCHOR" -t ssh_egress_allow -T replace -f "$TABLE_FILE" >/dev/null 2>&1
+fi
+
+exit 0

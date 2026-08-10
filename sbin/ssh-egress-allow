@@ -1,0 +1,244 @@
+#!/bin/sh
+#
+# ssh-egress-allow — SSH 아웃바운드 화이트리스트 관리 CLI
+#
+#   ssh-egress-allow status                    현재 정책 상태
+#   ssh-egress-allow list                      등록된 예외 목록
+#   ssh-egress-allow add <ip|cidr|host> [사유]  예외 추가 + 즉시 반영
+#   ssh-egress-allow remove <ip|cidr|host>     예외 제거 + 즉시 반영
+#   ssh-egress-allow reload                    파일 → 커널 재동기화
+#   ssh-egress-allow test <host>               해당 목적지 22 포트 도달 여부 확인
+#   ssh-egress-allow verify                    차단이 실제로 동작하는지 실증 검증
+#
+# 주의: sudo 의 secure_path 에는 /usr/local/sbin 이 없다(macOS 기본값).
+#       root 가 필요한 명령은 절대 경로로 실행할 것:
+#         sudo /usr/local/sbin/ssh-egress-allow status
+#
+set -u
+
+PFCTL=/sbin/pfctl
+ANCHOR=com.kyobo.ssh-egress
+TABLE=ssh_egress_allow
+TABLE_FILE=/etc/pf.anchors/ssh-egress-allow.table
+
+die() { echo "오류: $*" >&2; exit 1; }
+need_root() {
+    [ "$(id -u)" -eq 0 ] ||
+        die "이 명령은 root 권한이 필요합니다:  sudo /usr/local/sbin/ssh-egress-allow ${1:-<명령>}
+     (sudo 의 secure_path 에 /usr/local/sbin 이 없어 절대 경로가 필요합니다.)"
+}
+
+# 커널 테이블을 파일 기준으로 교체
+sync_table() {
+    "$PFCTL" -a "$ANCHOR" -t "$TABLE" -T replace -f "$TABLE_FILE" 2>&1 |
+        grep -v '^[0-9]* addresses' || true
+}
+
+# IP / CIDR / 호스트명 형태인지 대략 검증
+validate_target() {
+    case "$1" in
+        # IPv4 / IPv4+CIDR
+        [0-9]*.[0-9]*.[0-9]*.[0-9]*|[0-9]*.[0-9]*.[0-9]*.[0-9]*/[0-9]*) return 0 ;;
+        # IPv6 (콜론 포함)
+        *:*) return 0 ;;
+        # 호스트명
+        [A-Za-z0-9]*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+cmd_status() {
+    need_root status
+    echo "── pf 상태 ──────────────────────────────────────────"
+    "$PFCTL" -s info 2>/dev/null | head -2 || die "pf 조회 실패 (root 권한 필요)"
+    echo
+    echo "── 적용 중인 규칙 (앵커: $ANCHOR) ───────────────────"
+    "$PFCTL" -a "$ANCHOR" -s rules 2>/dev/null || echo "  (앵커가 로드되지 않음 — 정책 미적용 상태!)"
+    echo
+    echo "── 커널에 적재된 화이트리스트 ───────────────────────"
+    out=$("$PFCTL" -a "$ANCHOR" -t "$TABLE" -T show 2>/dev/null)
+    if [ -z "$out" ]; then echo "  (비어 있음 — 모든 SSH 아웃바운드 차단)"; else echo "$out"; fi
+}
+
+cmd_list() {
+    [ -f "$TABLE_FILE" ] || die "화이트리스트 파일이 없습니다: $TABLE_FILE"
+    echo "── 등록된 예외 ($TABLE_FILE) ────────────────────────"
+    entries=$(grep -v '^[[:space:]]*#' "$TABLE_FILE" | grep -v '^[[:space:]]*$')
+    if [ -z "$entries" ]; then
+        echo "  (없음 — 모든 SSH 아웃바운드 차단)"
+    else
+        grep -v '^[[:space:]]*#' "$TABLE_FILE" | grep -v '^[[:space:]]*$' | sed 's/^/  /'
+    fi
+}
+
+cmd_add() {
+    need_root add
+    target=${1:-}; shift 2>/dev/null || true
+    reason=${*:-}
+    [ -n "$target" ] || die "사용법: ssh-egress-allow add <ip|cidr|host> [사유]"
+    validate_target "$target" || die "'$target' 은(는) 유효한 IP/CIDR/호스트명이 아닙니다."
+    [ -n "$reason" ] || die "사유를 반드시 남겨 주세요. 예: ssh-egress-allow add 192.0.2.10/32 \"빌드서버 (TICKET-123)\""
+
+    if grep -v '^[[:space:]]*#' "$TABLE_FILE" | awk '{print $1}' | grep -qx -- "$target"; then
+        echo "이미 등록되어 있습니다: $target"; exit 0
+    fi
+
+    # 호스트명은 로드 시점 1회 해석 → 경고
+    case "$target" in
+        *[A-Za-z]*) case "$target" in
+            *:*) ;;
+            *) echo "경고: 호스트명은 pf 로드 시점에만 DNS 해석됩니다. IP 가 바뀌는 서비스는 CIDR 로 등록하세요." >&2 ;;
+        esac ;;
+    esac
+
+    backup="${TABLE_FILE}.bak"
+    cp "$TABLE_FILE" "$backup"
+    printf '%s\t# %s — added %s by %s\n' \
+        "$target" "$reason" "$(date +%F)" "${SUDO_USER:-$(id -un)}" >> "$TABLE_FILE"
+
+    if ! sync_table; then
+        cp "$backup" "$TABLE_FILE"
+        die "커널 반영 실패 — 변경을 되돌렸습니다."
+    fi
+    echo "추가됨: $target  ($reason)"
+    cmd_list
+}
+
+cmd_remove() {
+    need_root remove
+    target=${1:-}
+    [ -n "$target" ] || die "사용법: ssh-egress-allow remove <ip|cidr|host>"
+
+    if ! grep -v '^[[:space:]]*#' "$TABLE_FILE" | awk '{print $1}' | grep -qx -- "$target"; then
+        die "등록되어 있지 않습니다: $target"
+    fi
+
+    backup="${TABLE_FILE}.bak"
+    cp "$TABLE_FILE" "$backup"
+    tmp=$(mktemp)
+    awk -v t="$target" '
+        /^[[:space:]]*#/ { print; next }
+        /^[[:space:]]*$/ { print; next }
+        $1 == t { next }
+        { print }
+    ' "$TABLE_FILE" > "$tmp"
+    cat "$tmp" > "$TABLE_FILE"
+    rm -f "$tmp"
+
+    if ! sync_table; then
+        cp "$backup" "$TABLE_FILE"
+        die "커널 반영 실패 — 변경을 되돌렸습니다."
+    fi
+    echo "제거됨: $target"
+    cmd_list
+}
+
+cmd_reload() {
+    need_root reload
+    [ -f "$TABLE_FILE" ] || die "화이트리스트 파일이 없습니다: $TABLE_FILE"
+    sync_table || die "재동기화 실패"
+    echo "화이트리스트를 커널에 재적재했습니다."
+    cmd_list
+}
+
+cmd_test() {
+    host=${1:-}
+    [ -n "$host" ] || die "사용법: ssh-egress-allow test <host>"
+    echo "$host:22 도달 여부 확인 중..."
+    if nc -G 5 -z "$host" 22 2>&1; then
+        echo "→ 허용됨 (연결 성공)"
+    else
+        echo "→ 차단됨 (정책 적용 중)"
+    fi
+}
+
+# 정책이 말한 대로 동작하는지 패킷 수준에서 확인한다.
+#   1) 앵커가 커널에 적재되었는가
+#   2) 물리 인터페이스로 TCP/22 SYN 이 새어 나가지 않는가 (정책 누수)
+#   3) 차단이 타임아웃이 아니라 즉시 거부로 끝나는가
+# 검사 대상은 기본 게이트웨이다. 화이트리스트에 없는 임의의 목적지면 되고,
+# LAN 안에 있어 상위 방화벽의 영향을 받지 않으므로 판정이 흐려지지 않는다.
+cmd_verify() {
+    need_root verify
+    probe=$(route -n get default 2>/dev/null | awk '/gateway:/{print $2}')
+    iface=$(route -n get default 2>/dev/null | awk '/interface:/{print $2}')
+    [ -n "$probe" ] && [ -n "$iface" ] ||
+        die "기본 게이트웨이를 찾지 못했습니다. 네트워크에 연결한 뒤 다시 실행하세요."
+
+    if grep -v '^[[:space:]]*#' "$TABLE_FILE" 2>/dev/null | awk '{print $1}' | grep -qx -- "$probe"; then
+        die "게이트웨이($probe)가 화이트리스트에 있어 검증 대상으로 쓸 수 없습니다."
+    fi
+
+    # 종료 코드: 0 = 정상, 1 = 차단은 되지만 부가 항목 미충족, 2 = 차단 자체가 깨짐
+    rc=0
+    soft() { [ "$rc" -eq 0 ] && rc=1; return 0; }
+
+    echo "── 1. 규칙 적재 ─────────────────────────────────────"
+    if "$PFCTL" -a "$ANCHOR" -s rules 2>/dev/null | grep -q '^block return in'; then
+        echo "  ✓ 차단 규칙이 커널에 적재되어 있습니다."
+    else
+        echo "  ✗ 앵커가 비어 있습니다 — 정책 미적용 상태!"
+        return 2
+    fi
+
+    echo
+    echo "── 2. 정책 누수 ($iface 로 TCP/22 SYN 유출) ─────────"
+    dump=$(mktemp)
+    tcpdump -i "$iface" -n -c 1 "tcp[tcpflags] & tcp-syn != 0 and dst port 22" \
+        >"$dump" 2>/dev/null &
+    dumppid=$!
+    sleep 1
+    t0=$(date +%s)
+    nc -G 3 -w 3 -z "$probe" 22 >/dev/null 2>&1 && connected=yes || connected=no
+    t1=$(date +%s)
+    sleep 1
+    kill "$dumppid" 2>/dev/null
+    wait "$dumppid" 2>/dev/null
+
+    if grep -q 'IP ' "$dump" 2>/dev/null; then
+        echo "  ✗ SYN 이 물리 인터페이스로 나갔습니다 — 차단이 우회되고 있습니다!"
+        sed 's/^/    /' "$dump"
+        rc=2
+    else
+        echo "  ✓ 유출 없음 ($probe:22 로 나간 SYN 이 관측되지 않음)"
+    fi
+    rm -f "$dump"
+
+    echo
+    echo "── 3. 거부 방식 ─────────────────────────────────────"
+    elapsed=$((t1 - t0))
+    if [ "$connected" = yes ]; then
+        echo "  ✗ $probe:22 에 연결되었습니다 — 차단되지 않고 있습니다!"
+        rc=2
+    elif [ "$elapsed" -le 1 ]; then
+        echo "  ✓ 즉시 거부 (${elapsed}초) — RST 가 로컬 소켓까지 전달됩니다."
+    else
+        echo "  ! 타임아웃까지 대기 (${elapsed}초) — 차단은 되지만 RST 가 돌아오지"
+        echo "    않습니다. lo0 우회(route-to) 가 동작하지 않는 환경입니다."
+        soft
+    fi
+
+    echo
+    echo "── 4. pflog0 ────────────────────────────────────────"
+    if ifconfig pflog0 >/dev/null 2>&1; then
+        echo "  ✓ 존재 — sudo tcpdump -n -e -ttt -i pflog0 으로 감사 가능"
+    else
+        echo "  ! 없음 — 차단 시도가 기록되지 않습니다. 생성: sudo ifconfig pflog0 create"
+        soft
+    fi
+
+    return $rc
+}
+
+case "${1:-status}" in
+    status)  cmd_status ;;
+    list)    cmd_list ;;
+    add)     shift; cmd_add "$@" ;;
+    remove|rm|del) shift; cmd_remove "$@" ;;
+    reload)  cmd_reload ;;
+    test)    shift; cmd_test "$@" ;;
+    verify)  cmd_verify ;;
+    -h|--help|help)
+        sed -n '3,16p' "$0" | sed 's/^# \{0,1\}//' ;;
+    *) die "알 수 없는 명령: $1  (--help 참고)" ;;
+esac

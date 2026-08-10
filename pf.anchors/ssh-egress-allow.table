@@ -1,0 +1,15 @@
+# com.kyobo.ssh-egress — SSH 아웃바운드 화이트리스트
+#
+# 이 파일에 등록된 목적지에 한해 TCP/22 아웃바운드가 허용된다.
+# 한 줄에 하나씩. IP / CIDR / 호스트명 사용 가능. `#` 뒤는 주석.
+#
+# 직접 편집하지 말고 관리 CLI 사용을 권장한다(문법 검증 + 즉시 반영):
+#
+#   sudo ssh-egress-allow add 192.0.2.10/32 "빌드서버 (TICKET-123)"
+#   sudo ssh-egress-allow remove 192.0.2.10/32
+#   sudo ssh-egress-allow list
+#
+# 주의: 호스트명은 pf 로드 시점에 1회만 DNS 해석된다. IP 가 바뀌는
+#       서비스(예: github.com)는 반드시 CIDR 로 등록할 것.
+#
+# --- 등록된 예외 (아래에 추가) ---

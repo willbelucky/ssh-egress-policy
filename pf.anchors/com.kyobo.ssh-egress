@@ -1,0 +1,55 @@
+#
+# com.kyobo.ssh-egress — Outbound SSH egress policy
+#
+# 정책: TCP/22 아웃바운드 기본 차단(default-deny).
+#       화이트리스트 테이블에 등록된 목적지만 예외 허용.
+#
+# 이 파일은 /etc/pf.anchors/com.kyobo.ssh-egress 로 설치되며
+# /etc/pf.conf 의 `load anchor` 지시자에 의해 부팅 시 로드된다.
+# 화이트리스트는 이 파일이 아니라 아래 테이블 파일에서 관리한다.
+#
+
+# --- 화이트리스트 테이블 ------------------------------------------------
+# persist: 참조하는 규칙이 없어도 테이블을 커널에 유지 → 런타임에
+#          `pfctl -a com.kyobo.ssh-egress -t ssh_egress_allow -T ...` 로 조작 가능.
+# file:    pf.conf 리로드 시 파일 내용으로 자동 재적재 → 재부팅에도 유지.
+table <ssh_egress_allow> persist file "/etc/pf.anchors/ssh-egress-allow.table"
+
+# --- 통제 대상 포트 ------------------------------------------------------
+# 알려진 대체 SSH 포트를 추가하려면 여기에 넣는다. 예: "{ 22, 2222 }"
+ssh_ports = "{ 22 }"
+
+# --- 1) 루프백은 항상 허용 ----------------------------------------------
+# 로컬 포트포워딩, 컨테이너/VM 내부 SSH, 로컬 git 등을 깨뜨리지 않기 위함.
+pass out quick inet  proto tcp from any to 127.0.0.0/8 port $ssh_ports
+pass out quick inet6 proto tcp from any to ::1         port $ssh_ports
+
+# --- 2) 화이트리스트 목적지 허용 ----------------------------------------
+# 테이블이 비어 있으면 이 규칙은 아무것도 매치하지 않는다(= 전면 차단).
+pass out quick proto tcp to <ssh_egress_allow> port $ssh_ports
+
+# --- 3) 기본 거부 --------------------------------------------------------
+# 드롭이 아니라 RST 로 즉시 거부한다. 타임아웃까지 매달리지 않아야 사용자가
+# 정책 위반을 바로 인지한다.
+#
+# 단, macOS 의 pf 는 out 방향 `block return` 이 만든 RST 를 로컬 소켓까지
+# 되돌려주지 못한다(RST 가 물리 인터페이스로 나가버린다). `block return out`
+# 만 걸면 실제 동작은 조용한 드롭이 되고 connect() 는 타임아웃까지 대기한다.
+#
+# 그래서 차단 대상 SYN 을 route-to 로 lo0 에 밀어 넣은 뒤, lo0 의 in 방향에서
+# block return 한다. 이 방향에서 생성된 RST 는 lo0 를 거쳐 로컬 TCP 스택까지
+# 정상적으로 전달되므로 connect() 가 즉시 ECONNREFUSED 로 실패한다.
+
+# 3-a) 재귀 방지 — 이미 lo0 로 밀어 넣은 패킷을 다시 route-to 하지 않는다.
+pass out quick on lo0 proto tcp to any port $ssh_ports
+
+# 3-b) 차단 대상을 lo0 로 우회. 상태를 만들 이유가 없으므로 no state.
+pass out quick route-to (lo0 127.0.0.1) inet  proto tcp to any port $ssh_ports no state
+pass out quick route-to (lo0 ::1)       inet6 proto tcp to any port $ssh_ports no state
+
+# 3-c) lo0 에 도착한 차단 대상을 RST 로 거부하고 기록한다.
+# `log` : pflog0 으로 기록 → `tcpdump -n -e -i pflog0` 로 차단 시도 감사 가능.
+#         (pflog0 인터페이스는 pf-ssh-egress-apply 가 없으면 생성한다.)
+# 제외  : 루프백행 SSH 는 1) 에서 이미 통과했으므로 여기서 건드리지 않는다.
+block return in quick log on lo0 inet  proto tcp to ! 127.0.0.0/8 port $ssh_ports
+block return in quick log on lo0 inet6 proto tcp to ! ::1         port $ssh_ports
