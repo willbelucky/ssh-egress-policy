@@ -1,0 +1,19 @@
+# com.kyobo.ssh-egress — SSH-over-443 차단 대상 호스트
+#
+# 443 위로 SSH 를 태우는 것으로 알려진 엔드포인트의 "호스트명" 을 적는다.
+# pf-ssh-egress-deny443 이 이 목록을 DNS 로 해석해
+# /etc/pf.anchors/ssh-egress-deny443.table (실제 차단 IP 목록) 을 생성한다.
+#
+# 한 줄에 하나씩. `#` 뒤는 주석.
+#
+#   sudo /usr/local/sbin/ssh-egress-allow deny443 refresh   갱신
+#   sudo /usr/local/sbin/ssh-egress-allow deny443 list      결과 확인
+#
+# 주의: 여기에 HTTPS 도 함께 서비스하는 호스트(예: github.com)를 넣으면
+#       웹/HTTPS 업무가 끊긴다. .protect 파일이 그런 IP 를 걸러내지만,
+#       애초에 SSH 전용 엔드포인트만 넣는 것이 원칙이다.
+#
+# --- 차단 대상 ---
+ssh.github.com          # GitHub SSH-over-HTTPS (github.com 과 IP 분리됨)
+altssh.gitlab.com       # GitLab SaaS SSH-over-HTTPS
+altssh.bitbucket.org    # Bitbucket Cloud SSH-over-HTTPS

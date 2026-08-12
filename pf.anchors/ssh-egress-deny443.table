@@ -1,0 +1,9 @@
+# com.kyobo.ssh-egress — SSH-over-443 차단 IP (자동 생성 — 직접 편집 금지)
+#
+# 이 파일은 pf-ssh-egress-deny443 이 ssh-egress-deny443.hosts 를 DNS 로
+# 해석해 덮어쓴다. 여기를 직접 고쳐도 다음 갱신 때 사라진다.
+#
+# 차단 대상을 바꾸려면 .hosts 를 편집한 뒤:
+#   sudo /usr/local/sbin/ssh-egress-allow deny443 refresh
+#
+# 비어 있으면 443 차단이 적용되지 않는다(설치 직후 상태).

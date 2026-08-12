@@ -10,6 +10,7 @@ set -euo pipefail
 
 ANCHOR=com.kyobo.ssh-egress
 LABEL=com.kyobo.pf-ssh-egress
+LABEL443=com.kyobo.pf-ssh-egress-deny443
 PFCONF=/etc/pf.conf
 SRC="$(cd "$(dirname "$0")" && pwd)"
 MARK_BEGIN="# >>> ${ANCHOR} (managed — do not edit by hand) >>>"
@@ -42,6 +43,26 @@ else
     ok "/etc/pf.anchors/ssh-egress-allow.table (비어 있음 = 전면 차단)"
 fi
 
+# SSH-over-443 차단 설정. .hosts / .protect 는 운영자가 편집하는 파일이므로
+# 재설치 시 보존한다. .table 은 자동 생성물이라 없을 때만 씨앗을 깔아 둔다
+# (앵커의 `table ... file` 지시자가 로드 시점에 파일 존재를 요구한다).
+info "SSH-over-443 차단 설정 설치"
+for f in ssh-egress-deny443.hosts ssh-egress-deny443.protect; do
+    if [ -f "/etc/pf.anchors/$f" ]; then
+        warn "$f 이미 존재 — 보존합니다."
+    else
+        install -m 644 -o root -g wheel "$SRC/pf.anchors/$f" "/etc/pf.anchors/$f"
+        ok "/etc/pf.anchors/$f"
+    fi
+done
+if [ -f /etc/pf.anchors/ssh-egress-deny443.table ]; then
+    ok "/etc/pf.anchors/ssh-egress-deny443.table (기존 목록 유지 — 아래에서 갱신)"
+else
+    install -m 644 -o root -g wheel \
+        "$SRC/pf.anchors/ssh-egress-deny443.table" /etc/pf.anchors/ssh-egress-deny443.table
+    ok "/etc/pf.anchors/ssh-egress-deny443.table (비어 있음 — 아래에서 채움)"
+fi
+
 # ── 3. pf.conf 에 앵커 등록 (멱등) ─────────────────────────────────────
 info "$PFCONF 에 앵커 등록"
 if grep -qF "$MARK_BEGIN" "$PFCONF"; then
@@ -70,9 +91,11 @@ ok "문법 정상"
 # ── 5. 실행 스크립트 / 데몬 설치 ───────────────────────────────────────
 info "관리 스크립트 설치"
 install -d -m 755 -o root -g wheel /usr/local/libexec /usr/local/sbin
-install -m 755 -o root -g wheel "$SRC/libexec/pf-ssh-egress-apply" /usr/local/libexec/pf-ssh-egress-apply
-install -m 755 -o root -g wheel "$SRC/sbin/ssh-egress-allow"       /usr/local/sbin/ssh-egress-allow
+install -m 755 -o root -g wheel "$SRC/libexec/pf-ssh-egress-apply"   /usr/local/libexec/pf-ssh-egress-apply
+install -m 755 -o root -g wheel "$SRC/libexec/pf-ssh-egress-deny443" /usr/local/libexec/pf-ssh-egress-deny443
+install -m 755 -o root -g wheel "$SRC/sbin/ssh-egress-allow"         /usr/local/sbin/ssh-egress-allow
 ok "/usr/local/libexec/pf-ssh-egress-apply"
+ok "/usr/local/libexec/pf-ssh-egress-deny443"
 ok "/usr/local/sbin/ssh-egress-allow"
 
 info "LaunchDaemon 설치 (부팅 시 적용 + 5분 주기 자가치유)"
@@ -80,6 +103,12 @@ install -m 644 -o root -g wheel "$SRC/LaunchDaemons/$LABEL.plist" "/Library/Laun
 launchctl bootout "system/$LABEL" 2>/dev/null || true
 launchctl bootstrap system "/Library/LaunchDaemons/$LABEL.plist"
 ok "$LABEL"
+
+info "LaunchDaemon 설치 (SSH-over-443 차단 IP 6시간 주기 갱신)"
+install -m 644 -o root -g wheel "$SRC/LaunchDaemons/$LABEL443.plist" "/Library/LaunchDaemons/$LABEL443.plist"
+launchctl bootout "system/$LABEL443" 2>/dev/null || true
+launchctl bootstrap system "/Library/LaunchDaemons/$LABEL443.plist"
+ok "$LABEL443"
 
 # ── 6. 즉시 적용 ───────────────────────────────────────────────────────
 info "pflog0 확보 (차단 시도 로깅용)"
@@ -110,7 +139,20 @@ else
     exit 1
 fi
 
-# ── 8. 실증 검증 ───────────────────────────────────────────────────────
+# ── 8. SSH-over-443 차단 IP 채우기 ─────────────────────────────────────
+# 앵커에는 규칙만 있고 대상 IP 는 비어 있는 상태다. DNS 로 해석해 채운다.
+# 실패해도 설치를 중단하지 않는다 — 22 번 차단은 이미 동작 중이고, 443 차단은
+# 6시간 주기 데몬이 다음 차례에 다시 시도한다.
+echo
+info "SSH-over-443 차단 IP 갱신"
+if VERBOSE=1 /usr/local/libexec/pf-ssh-egress-deny443 2>&1 | sed 's/^/    /'; then
+    ok "갱신 완료"
+else
+    warn "갱신 실패 (DNS 등) — 22번 차단은 정상 동작합니다."
+    warn "복구: sudo /usr/local/sbin/ssh-egress-allow deny443 refresh"
+fi
+
+# ── 9. 실증 검증 ───────────────────────────────────────────────────────
 # 규칙이 적재된 것과 실제로 막히는 것은 다르다. 기본 거부는 route-to 로
 # lo0 를 경유시키는데, 이 우회가 동작하지 않는 환경이라면 pass 규칙만 남아
 # SSH 가 그대로 나가버릴 수 있다. 그래서 물리 인터페이스로 SYN 이 새는지를
@@ -145,6 +187,8 @@ cat <<'EOF'
   화이트리스트 제거 : sudo /usr/local/sbin/ssh-egress-allow remove <ip|cidr>
   현재 상태 확인    : sudo /usr/local/sbin/ssh-egress-allow status
   실증 검증         : sudo /usr/local/sbin/ssh-egress-allow verify
+  443 차단 목록     : sudo /usr/local/sbin/ssh-egress-allow deny443 list
+  443 차단 갱신     : sudo /usr/local/sbin/ssh-egress-allow deny443 refresh
   차단 시도 감사    : sudo tcpdump -n -e -ttt -i pflog0
   제거              : sudo bash uninstall.sh
 EOF

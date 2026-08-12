@@ -1,6 +1,6 @@
 #!/bin/sh
 #
-# ssh-egress-allow — SSH 아웃바운드 화이트리스트 관리 CLI
+# ssh-egress-allow — SSH 아웃바운드 통제 관리 CLI
 #
 #   ssh-egress-allow status                    현재 정책 상태
 #   ssh-egress-allow list                      등록된 예외 목록
@@ -9,6 +9,10 @@
 #   ssh-egress-allow reload                    파일 → 커널 재동기화
 #   ssh-egress-allow test <host>               해당 목적지 22 포트 도달 여부 확인
 #   ssh-egress-allow verify                    차단이 실제로 동작하는지 실증 검증
+#
+#   ssh-egress-allow deny443 list              SSH-over-443 차단 IP 목록
+#   ssh-egress-allow deny443 hosts             차단 대상 호스트명(편집 원본)
+#   ssh-egress-allow deny443 refresh           DNS 재해석 → 차단 IP 갱신
 #
 # 주의: sudo 의 secure_path 에는 /usr/local/sbin 이 없다(macOS 기본값).
 #       root 가 필요한 명령은 절대 경로로 실행할 것:
@@ -20,6 +24,11 @@ PFCTL=/sbin/pfctl
 ANCHOR=com.kyobo.ssh-egress
 TABLE=ssh_egress_allow
 TABLE_FILE=/etc/pf.anchors/ssh-egress-allow.table
+
+DENY443_TABLE=ssh_deny_443
+DENY443_FILE=/etc/pf.anchors/ssh-egress-deny443.table
+DENY443_HOSTS=/etc/pf.anchors/ssh-egress-deny443.hosts
+DENY443_REFRESH=/usr/local/libexec/pf-ssh-egress-deny443
 
 die() { echo "오류: $*" >&2; exit 1; }
 need_root() {
@@ -58,6 +67,53 @@ cmd_status() {
     echo "── 커널에 적재된 화이트리스트 ───────────────────────"
     out=$("$PFCTL" -a "$ANCHOR" -t "$TABLE" -T show 2>/dev/null)
     if [ -z "$out" ]; then echo "  (비어 있음 — 모든 SSH 아웃바운드 차단)"; else echo "$out"; fi
+    echo
+    echo "── SSH-over-443 차단 IP ─────────────────────────────"
+    out=$("$PFCTL" -a "$ANCHOR" -t "$DENY443_TABLE" -T show 2>/dev/null)
+    if [ -z "$out" ]; then
+        echo "  (비어 있음 — 443 우회 차단 미적용)"
+        echo "  적용: sudo /usr/local/sbin/ssh-egress-allow deny443 refresh"
+    else
+        echo "$out"
+    fi
+}
+
+# SSH-over-443 차단 목록. 화이트리스트와 달리 사람이 IP 를 직접 넣지 않는다.
+# 원본은 호스트명(.hosts)이고 IP 는 DNS 해석 결과이므로, 편집 대상과 적용
+# 결과를 분리해서 보여 준다.
+cmd_deny443() {
+    case "${1:-list}" in
+        list)
+            echo "── 적용 중인 SSH-over-443 차단 IP ───────────────────"
+            if [ ! -f "$DENY443_FILE" ]; then
+                echo "  (파일 없음: $DENY443_FILE)"
+                return 0
+            fi
+            entries=$(sed 's/#.*//' "$DENY443_FILE" | awk 'NF {print $1}')
+            if [ -z "$entries" ]; then
+                echo "  (비어 있음 — 443 우회 차단 미적용)"
+                echo "  적용: sudo /usr/local/sbin/ssh-egress-allow deny443 refresh"
+            else
+                echo "$entries" | sed 's/^/  /'
+            fi
+            echo
+            echo "  원본 호스트 목록: $DENY443_HOSTS"
+            ;;
+        hosts)
+            [ -f "$DENY443_HOSTS" ] || die "차단 대상 목록이 없습니다: $DENY443_HOSTS"
+            echo "── 차단 대상 호스트 ($DENY443_HOSTS) ────────────────"
+            entries=$(sed 's/#.*//' "$DENY443_HOSTS" | awk 'NF {print $1}')
+            if [ -z "$entries" ]; then echo "  (없음)"; else echo "$entries" | sed 's/^/  /'; fi
+            echo
+            echo "  편집 후 반영: sudo /usr/local/sbin/ssh-egress-allow deny443 refresh"
+            ;;
+        refresh)
+            need_root "deny443 refresh"
+            [ -x "$DENY443_REFRESH" ] || die "갱신 스크립트가 없습니다: $DENY443_REFRESH"
+            VERBOSE=1 "$DENY443_REFRESH" || die "갱신 실패 (자세한 내용: /var/log/pf-ssh-egress.log)"
+            ;;
+        *) die "사용법: ssh-egress-allow deny443 {list|hosts|refresh}" ;;
+    esac
 }
 
 cmd_list() {
@@ -227,6 +283,27 @@ cmd_verify() {
         soft
     fi
 
+    # 443 차단은 일부러 실트래픽으로 검증하지 않는다. 검증하겠다고 실제로
+    # ssh.github.com:443 에 붙어 보면 그 시도 자체가 상위 방화벽에 정책 위반으로
+    # 기록된다. 규칙 적재와 테이블 내용만 확인한다.
+    echo
+    echo "── 5. SSH-over-443 차단 ─────────────────────────────"
+    if "$PFCTL" -a "$ANCHOR" -s rules 2>/dev/null | grep -q 'port = 443'; then
+        echo "  ✓ 443 차단 규칙이 커널에 적재되어 있습니다."
+    else
+        echo "  ! 443 차단 규칙이 없습니다 — 앵커가 구버전일 수 있습니다."
+        soft
+    fi
+
+    d_out=$("$PFCTL" -a "$ANCHOR" -t "$DENY443_TABLE" -T show 2>/dev/null | tr -d ' ')
+    if [ -z "$d_out" ]; then
+        echo "  ! 차단 IP 가 비어 있어 실제로 막히는 목적지가 없습니다."
+        echo "    적용: sudo /usr/local/sbin/ssh-egress-allow deny443 refresh"
+        soft
+    else
+        echo "  ✓ 차단 IP $(echo "$d_out" | wc -l | tr -d ' ')개 적재: $(echo "$d_out" | tr '\n' ' ')"
+    fi
+
     return $rc
 }
 
@@ -238,7 +315,8 @@ case "${1:-status}" in
     reload)  cmd_reload ;;
     test)    shift; cmd_test "$@" ;;
     verify)  cmd_verify ;;
+    deny443) shift; cmd_deny443 "$@" ;;
     -h|--help|help)
-        sed -n '3,16p' "$0" | sed 's/^# \{0,1\}//' ;;
+        sed -n '3,20p' "$0" | sed 's/^# \{0,1\}//' ;;
     *) die "알 수 없는 명령: $1  (--help 참고)" ;;
 esac
