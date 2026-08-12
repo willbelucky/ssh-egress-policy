@@ -40,12 +40,19 @@ if ! "$PFCTL" -a "$ANCHOR" -s rules 2>/dev/null | /usr/bin/grep -q "^block retur
     "$PFCTL" -f "$PFCONF" 2>&1 | while read -r l; do log "$l"; done
 fi
 
-# 3) 화이트리스트 테이블을 파일 기준으로 동기화.
+# 3) 테이블을 파일 기준으로 동기화.
 #    (pf.conf 의 `file` 지시자가 로드 시점에 이미 채우지만, 파일만 수정되고
 #     리로드가 없었던 경우를 대비해 항상 맞춰 준다.)
-TABLE_FILE=/etc/pf.anchors/ssh-egress-allow.table
-if [ -f "$TABLE_FILE" ]; then
-    "$PFCTL" -a "$ANCHOR" -t ssh_egress_allow -T replace -f "$TABLE_FILE" >/dev/null 2>&1
+#    DNS 질의는 여기서 하지 않는다. 차단 IP 갱신은 pf-ssh-egress-deny443 의
+#    몫이고, 이 스크립트는 파일 → 커널 반영만 책임진다.
+ALLOW_FILE=/etc/pf.anchors/ssh-egress-allow.table
+if [ -f "$ALLOW_FILE" ]; then
+    "$PFCTL" -a "$ANCHOR" -t ssh_egress_allow -T replace -f "$ALLOW_FILE" >/dev/null 2>&1
+fi
+
+DENY443_FILE=/etc/pf.anchors/ssh-egress-deny443.table
+if [ -f "$DENY443_FILE" ]; then
+    "$PFCTL" -a "$ANCHOR" -t ssh_deny_443 -T replace -f "$DENY443_FILE" >/dev/null 2>&1
 fi
 
 exit 0

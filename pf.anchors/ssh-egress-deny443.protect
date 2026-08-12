@@ -1,0 +1,20 @@
+# com.kyobo.ssh-egress — SSH-over-443 차단에서 반드시 제외할 호스트
+#
+# 여기 적힌 호스트명이 해석되는 IP 는 차단 목록에서 무조건 빠진다.
+# 목적: SSH 엔드포인트와 HTTPS 엔드포인트가 같은 IP 를 쓰는 경우(또는 향후
+#       그렇게 바뀌는 경우) 정상 업무(git over HTTPS, 웹, API)가 끊기는 사고 방지.
+#
+# 차단은 "확실히 SSH 전용인 IP" 에만 걸려야 한다. 판단이 애매하면 열어 둔다.
+# — 통제 실패보다 업무 중단이 더 비싸고, 443 의 응용 계층 식별은 사내 방화벽이
+#   담당하는 이중 구조이기 때문이다.
+#
+# 한 줄에 하나씩. `#` 뒤는 주석.
+#
+# --- 보호 대상 ---
+github.com
+api.github.com
+codeload.github.com
+objects.githubusercontent.com
+raw.githubusercontent.com
+gitlab.com
+bitbucket.org

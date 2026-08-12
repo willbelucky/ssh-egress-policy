@@ -1,0 +1,132 @@
+#!/bin/sh
+#
+# pf-ssh-egress-deny443 — SSH-over-443 차단 목록 갱신
+#
+# .hosts 의 호스트명을 DNS 로 해석해 <ssh_deny_443> 테이블을 다시 만든다.
+# LaunchDaemon(com.kyobo.pf-ssh-egress-deny443)이 부팅 시 1회 + 6시간 주기로 실행.
+#
+# 왜 IP 를 주기 갱신하는가:
+#   pf 는 호스트명을 룰셋 로드 시점에 1회만 해석한다. ssh.github.com 같은
+#   엔드포인트는 IP 가 바뀌므로, 호스트명을 그대로 두면 정책이 조용히 빗나간다.
+#
+# 안전 원칙 — 통제 실패보다 업무 중단이 더 비싸다:
+#   1. .protect 에 적힌 호스트의 IP 는 무조건 차단 목록에서 제외한다.
+#      (SSH 엔드포인트와 HTTPS 엔드포인트가 같은 IP 를 쓰게 되면 443 을 막는 순간
+#       git over HTTPS·웹·API 가 전부 끊긴다.)
+#   2. DNS 가 전부 실패하면 기존 목록을 유지한다. 빈 목록으로 덮어쓰지 않는다.
+#   3. 해석은 됐는데 전부 보호 대상과 겹치면 목록을 비운다(= 차단 해제).
+#      IP 가 공유되기 시작했다는 뜻이므로 막으면 안 된다.
+#
+set -u
+
+DIG=/usr/bin/dig
+PFCTL=/sbin/pfctl
+ANCHOR=com.kyobo.ssh-egress
+TABLE=ssh_deny_443
+TABLE_FILE=/etc/pf.anchors/ssh-egress-deny443.table
+HOSTS_FILE=/etc/pf.anchors/ssh-egress-deny443.hosts
+PROTECT_FILE=/etc/pf.anchors/ssh-egress-deny443.protect
+TAG=pf-ssh-egress-deny443
+
+VERBOSE=${VERBOSE:-0}
+log() {
+    /usr/bin/logger -t "$TAG" -- "$*"
+    [ "$VERBOSE" = 1 ] && echo "$*"
+    return 0
+}
+
+[ "$(/usr/bin/id -u)" -eq 0 ] || { echo "root 권한 필요" >&2; exit 1; }
+[ -f "$HOSTS_FILE" ] || { log "차단 대상 목록 없음($HOSTS_FILE) — 건너뜀"; exit 0; }
+
+# 주석/빈 줄을 걷어내고 첫 필드만 취한다.
+read_list() {
+    [ -f "$1" ] || return 0
+    /usr/bin/sed 's/#.*//' "$1" | /usr/bin/awk 'NF {print $1}'
+}
+
+resolve() {
+    _h=$1
+    "$DIG" +short +time=3 +tries=2 "$_h" A    2>/dev/null |
+        /usr/bin/grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
+    "$DIG" +short +time=3 +tries=2 "$_h" AAAA 2>/dev/null |
+        /usr/bin/grep -E '^[0-9A-Fa-f]{0,4}:[0-9A-Fa-f:]+$'
+}
+
+TMPDIR_=$(/usr/bin/mktemp -d) || exit 1
+trap '/bin/rm -rf "$TMPDIR_"' EXIT INT TERM
+DENY="$TMPDIR_/deny"; PROTECT="$TMPDIR_/protect"; FINAL="$TMPDIR_/final"
+: >"$DENY"; : >"$PROTECT"
+
+for h in $(read_list "$HOSTS_FILE"); do
+    ips=$(resolve "$h")
+    if [ -z "$ips" ]; then
+        log "경고: '$h' DNS 해석 실패"
+        continue
+    fi
+    echo "$ips" >>"$DENY"
+done
+
+for h in $(read_list "$PROTECT_FILE"); do
+    resolve "$h" >>"$PROTECT" 2>/dev/null
+done
+
+/usr/bin/sort -u "$DENY"    -o "$DENY"
+/usr/bin/sort -u "$PROTECT" -o "$PROTECT"
+
+# 안전 원칙 2 — DNS 전멸이면 기존 목록을 건드리지 않는다.
+if [ ! -s "$DENY" ]; then
+    log "경고: 차단 대상 IP 를 하나도 해석하지 못했습니다 — 기존 목록 유지"
+    exit 0
+fi
+
+# 보호 대상과 겹치는 IP 제거 (안전 원칙 1)
+/usr/bin/comm -23 "$DENY" "$PROTECT" >"$FINAL"
+
+overlap=$(/usr/bin/comm -12 "$DENY" "$PROTECT")
+if [ -n "$overlap" ]; then
+    log "경고: SSH 엔드포인트 IP 가 보호 대상(HTTPS)과 겹쳐 차단에서 제외: $(echo "$overlap" | /usr/bin/tr '\n' ' ')"
+fi
+
+# 안전 원칙 3 — 전부 겹쳤다면 차단하지 않는다(빈 목록으로 반영).
+[ -s "$FINAL" ] || log "경고: 해석된 IP 가 모두 보호 대상과 겹칩니다 — 443 차단을 적용하지 않습니다"
+
+NEW="$TMPDIR_/table"
+{
+    echo "# com.kyobo.ssh-egress — SSH-over-443 차단 IP (자동 생성 — 직접 편집 금지)"
+    echo "#"
+    echo "# 생성: $(/bin/date '+%Y-%m-%d %H:%M:%S %z')  by $TAG"
+    echo "# 원본: $HOSTS_FILE"
+    echo "# 제외: $PROTECT_FILE (HTTPS 업무 보호)"
+    echo "#"
+    echo "# 수정하려면 .hosts 를 고친 뒤:"
+    echo "#   sudo /usr/local/sbin/ssh-egress-allow deny443 refresh"
+    echo "#"
+    /bin/cat "$FINAL"
+} >"$NEW"
+
+# 이전 목록과 비교 (로그를 조용하게 유지하기 위한 변경 감지)
+: >"$TMPDIR_/prev"
+if [ -f "$TABLE_FILE" ]; then
+    /usr/bin/sed 's/#.*//' "$TABLE_FILE" | /usr/bin/awk 'NF {print $1}' |
+        /usr/bin/sort -u >"$TMPDIR_/prev"
+fi
+if /usr/bin/cmp -s "$FINAL" "$TMPDIR_/prev"; then changed=no; else changed=yes; fi
+
+/bin/cat "$NEW" >"$TABLE_FILE" || { log "오류: $TABLE_FILE 쓰기 실패"; exit 1; }
+/bin/chmod 644 "$TABLE_FILE"; /usr/sbin/chown root:wheel "$TABLE_FILE" 2>/dev/null || true
+
+# 커널 반영
+if ! "$PFCTL" -a "$ANCHOR" -t "$TABLE" -T replace -f "$TABLE_FILE" >/dev/null 2>&1; then
+    log "경고: 커널 테이블 반영 실패 — 앵커가 로드되지 않았을 수 있습니다"
+    exit 1
+fi
+
+count=$(/usr/bin/wc -l <"$FINAL" | /usr/bin/tr -d ' ')
+if [ "$changed" = yes ]; then
+    log "차단 목록 갱신: ${count}개 IP ($(/usr/bin/tr '\n' ' ' <"$FINAL"))"
+else
+    log "차단 목록 변경 없음: ${count}개 IP"
+fi
+
+[ "$VERBOSE" = 1 ] && { echo; echo "── 적용된 SSH-over-443 차단 IP (${count}) ──"; /bin/cat "$FINAL"; }
+exit 0

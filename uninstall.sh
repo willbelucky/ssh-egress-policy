@@ -8,6 +8,7 @@ set -euo pipefail
 
 ANCHOR=com.kyobo.ssh-egress
 LABEL=com.kyobo.pf-ssh-egress
+LABEL443=com.kyobo.pf-ssh-egress-deny443
 PFCONF=/etc/pf.conf
 
 info() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
@@ -16,9 +17,11 @@ ok()   { printf '\033[1;32m  ✓\033[0m %s\n' "$*"; }
 [ "$(id -u)" -eq 0 ] || { echo "root 권한이 필요합니다: sudo bash uninstall.sh" >&2; exit 1; }
 
 info "LaunchDaemon 해제"
-launchctl bootout "system/$LABEL" 2>/dev/null || true
-rm -f "/Library/LaunchDaemons/$LABEL.plist"
-ok "$LABEL"
+for l in "$LABEL" "$LABEL443"; do
+    launchctl bootout "system/$l" 2>/dev/null || true
+    rm -f "/Library/LaunchDaemons/$l.plist"
+    ok "$l"
+done
 
 info "$PFCONF 에서 앵커 제거"
 cp "$PFCONF" "${PFCONF}.bak.$(date +%Y%m%d-%H%M%S)"
@@ -26,8 +29,12 @@ sed -i '' "/^# >>> ${ANCHOR} /,/^# <<< ${ANCHOR} </d" "$PFCONF"
 ok "앵커 등록 해제"
 
 info "파일 제거"
-rm -f "/etc/pf.anchors/$ANCHOR" /usr/local/libexec/pf-ssh-egress-apply /usr/local/sbin/ssh-egress-allow
-ok "화이트리스트(/etc/pf.anchors/ssh-egress-allow.table)는 감사 목적으로 보존합니다."
+rm -f "/etc/pf.anchors/$ANCHOR" \
+      /usr/local/libexec/pf-ssh-egress-apply \
+      /usr/local/libexec/pf-ssh-egress-deny443 \
+      /usr/local/sbin/ssh-egress-allow
+ok "화이트리스트(ssh-egress-allow.table)와 443 차단 설정(ssh-egress-deny443.*)은"
+ok "감사 목적으로 /etc/pf.anchors 에 보존합니다."
 
 info "룰셋 재적재"
 pfctl -f "$PFCONF" 2>&1 | sed 's/^/    /' || true

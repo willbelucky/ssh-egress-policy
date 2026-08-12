@@ -1,12 +1,13 @@
 #
 # com.kyobo.ssh-egress — Outbound SSH egress policy
 #
-# 정책: TCP/22 아웃바운드 기본 차단(default-deny).
-#       화이트리스트 테이블에 등록된 목적지만 예외 허용.
+# 정책: (A) SSH 포트(22 및 알려진 대체 포트) 아웃바운드 기본 차단(default-deny).
+#           화이트리스트 테이블에 등록된 목적지만 예외 허용.
+#       (B) SSH-over-443 목적지(ssh.github.com 등) 는 TCP/443 로도 차단.
 #
 # 이 파일은 /etc/pf.anchors/com.kyobo.ssh-egress 로 설치되며
 # /etc/pf.conf 의 `load anchor` 지시자에 의해 부팅 시 로드된다.
-# 화이트리스트는 이 파일이 아니라 아래 테이블 파일에서 관리한다.
+# 화이트리스트/차단목록은 이 파일이 아니라 아래 테이블 파일에서 관리한다.
 #
 
 # --- 화이트리스트 테이블 ------------------------------------------------
@@ -15,9 +16,24 @@
 # file:    pf.conf 리로드 시 파일 내용으로 자동 재적재 → 재부팅에도 유지.
 table <ssh_egress_allow> persist file "/etc/pf.anchors/ssh-egress-allow.table"
 
+# --- SSH-over-443 차단 테이블 -------------------------------------------
+# 443 위로 SSH 를 태우는 것으로 알려진 목적지의 IP 만 담는다.
+# pf 는 포트/IP 기반이라 443 의 페이로드가 SSH 인지 TLS 인지 구분하지 못한다.
+# 그래서 "443 전체"가 아니라 "SSH 전용 엔드포인트 IP" 만 골라 막는다.
+# 예) github.com(HTTPS) 과 ssh.github.com(SSH) 은 IP 가 분리되어 있으므로
+#     후자만 넣으면 git over HTTPS 업무에는 영향이 없다.
+#
+# 이 테이블은 pf-ssh-egress-deny443 이 DNS 로 주기 갱신한다. 직접 편집하지 말 것.
+# 비어 있으면 아래 (4) 규칙은 아무것도 매치하지 않는다(= 443 차단 없음).
+table <ssh_deny_443> persist file "/etc/pf.anchors/ssh-egress-deny443.table"
+
 # --- 통제 대상 포트 ------------------------------------------------------
-# 알려진 대체 SSH 포트를 추가하려면 여기에 넣는다. 예: "{ 22, 2222 }"
-ssh_ports = "{ 22 }"
+# 22 외에 널리 쓰이는 대체 SSH 포트를 함께 통제한다. 포트를 바꿔 우회하는
+# 것을 막기 위함이며, 여기 없는 임의 포트까지 막지는 못한다(→ README 한계).
+ssh_ports = "{ 22, 2022, 2222 }"
+
+# SSH-over-443 통제 포트. <ssh_deny_443> 에 등록된 목적지에만 적용된다.
+deny443_ports = "{ 443 }"
 
 # --- 1) 루프백은 항상 허용 ----------------------------------------------
 # 로컬 포트포워딩, 컨테이너/VM 내부 SSH, 로컬 git 등을 깨뜨리지 않기 위함.
@@ -53,3 +69,19 @@ pass out quick route-to (lo0 ::1)       inet6 proto tcp to any port $ssh_ports n
 # 제외  : 루프백행 SSH 는 1) 에서 이미 통과했으므로 여기서 건드리지 않는다.
 block return in quick log on lo0 inet  proto tcp to ! 127.0.0.0/8 port $ssh_ports
 block return in quick log on lo0 inet6 proto tcp to ! ::1         port $ssh_ports
+
+# --- 4) SSH-over-443 목적지 거부 ----------------------------------------
+# 3) 과 동일한 lo0 우회 구조를 쓰되, 목적지를 <ssh_deny_443> 로 한정한다.
+# 이 테이블에 없는 443 트래픽(= 일반 HTTPS 전부)은 어떤 규칙에도 걸리지 않고
+# 앵커를 그대로 통과한다.
+
+# 4-a) 재귀 방지. 로컬 HTTPS(127.0.0.1:443) 도 여기서 함께 통과한다.
+pass out quick on lo0 proto tcp to any port $deny443_ports
+
+# 4-b) 차단 대상만 lo0 로 우회.
+pass out quick route-to (lo0 127.0.0.1) inet  proto tcp to <ssh_deny_443> port $deny443_ports no state
+pass out quick route-to (lo0 ::1)       inet6 proto tcp to <ssh_deny_443> port $deny443_ports no state
+
+# 4-c) RST 로 거부 + pflog0 기록.
+block return in quick log on lo0 inet  proto tcp to <ssh_deny_443> port $deny443_ports
+block return in quick log on lo0 inet6 proto tcp to <ssh_deny_443> port $deny443_ports

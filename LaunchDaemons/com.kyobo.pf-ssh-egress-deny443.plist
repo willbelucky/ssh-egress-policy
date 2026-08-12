@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.kyobo.pf-ssh-egress-deny443</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/libexec/pf-ssh-egress-deny443</string>
+    </array>
+
+    <!-- 부팅 직후 1회 갱신 -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!--
+      6시간 주기로 DNS 재해석.
+      SSH-over-443 엔드포인트의 IP 가 바뀌면 차단이 조용히 빗나가므로
+      주기적으로 다시 맞춰 준다. 자가치유(5분)와 달리 DNS 질의를 하므로
+      간격을 넉넉히 둔다.
+    -->
+    <key>StartInterval</key>
+    <integer>21600</integer>
+
+    <key>StandardOutPath</key>
+    <string>/var/log/pf-ssh-egress.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/pf-ssh-egress.log</string>
+</dict>
+</plist>
